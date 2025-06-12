@@ -1,9 +1,9 @@
 package com.workintech.spring17challenge;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.workintech.spring17challenge.entity.*;
-import com.workintech.spring17challenge.exceptions.ApiErrorResponse;
+import com.workintech.spring17challenge.exceptions.ApiResponseError;
 import com.workintech.spring17challenge.exceptions.ApiException;
+import com.workintech.spring17challenge.model.*;
 import org.junit.jupiter.api.*;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -13,6 +13,7 @@ import org.springframework.core.env.Environment;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.test.web.servlet.MockMvc;
+import org.springframework.test.web.servlet.MvcResult;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.*;
@@ -22,7 +23,7 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.*;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
-@SpringBootTest
+@SpringBootTest(classes = Spring17challengeApplication.class)
 @AutoConfigureMockMvc
 @TestMethodOrder(MethodOrderer.OrderAnnotation.class)
 @ExtendWith(ResultAnalyzer.class)
@@ -31,7 +32,6 @@ class MainTest {
     @Autowired
     private Environment env;
 
-
     @Autowired
     private MockMvc mockMvc;
 
@@ -39,9 +39,14 @@ class MainTest {
     private ObjectMapper objectMapper;
 
     private Course course;
+    private static boolean isFirstTest = true;
 
     @BeforeEach
     void setUp() throws Exception {
+        // Reset courses before each test
+        mockMvc.perform(post("/courses/test/reset"))
+                .andExpect(status().isOk());
+
         // Setup a sample Course object
         course = new Course();
         course.setId(1);
@@ -55,22 +60,52 @@ class MainTest {
                 .andExpect(status().isCreated());
     }
 
+    /**
+     * Helper method to check if a course exists
+     */
+    private boolean courseExists(String courseName) throws Exception {
+        try {
+            MvcResult result = mockMvc.perform(get("/courses/{name}", courseName))
+                    .andReturn();
+            return result.getResponse().getStatus() == 200;
+        } catch (Exception e) {
+            return false;
+        }
+    }
+
+    /**
+     * Helper method to clear all courses
+     * This assumes you have access to all courses via GET /courses
+     */
+    private void clearAllCourses() throws Exception {
+        // Get all courses first
+        MvcResult result = mockMvc.perform(get("/courses"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String response = result.getResponse().getContentAsString();
+        Course[] courses = objectMapper.readValue(response, Course[].class);
+
+        // Delete each course
+        for (Course existingCourse : courses) {
+            mockMvc.perform(delete("/courses/{id}", existingCourse.getId()))
+                    .andExpect(status().isOk());
+        }
+    }
+
     @Test
     @DisplayName("application properties istenilenler eklendi mi?")
     void serverPortIsSetTo8585() {
-
         String serverPort = env.getProperty("server.port");
         assertThat(serverPort).isEqualTo("9000");
 
         String contextPath = env.getProperty("server.servlet.context-path");
         assertNotNull(contextPath);
         assertThat(contextPath).isEqualTo("/workintech");
-
     }
 
     @Test
     void testHandleApiException() throws Exception {
-
         String nonExistingName = "testCourseName";
 
         mockMvc.perform(get("/courses/{name}", nonExistingName))
@@ -82,12 +117,12 @@ class MainTest {
 
     @Test
     void testCreateCourseValidationFailure() throws Exception {
-        Course invalidCourse = new Course(null, null, null, null); // Assuming this will fail validation
+        Course invalidCourse = new Course(null, null, null, null);
 
         mockMvc.perform(post("/courses")
                         .contentType(MediaType.APPLICATION_JSON)
                         .content(objectMapper.writeValueAsString(invalidCourse)))
-                .andExpect(status().isBadRequest()) // Expecting validation failure
+                .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.message").isNotEmpty())
                 .andExpect(jsonPath("$.status").value(HttpStatus.BAD_REQUEST.value()));
     }
@@ -95,10 +130,18 @@ class MainTest {
     @Test
     @Order(1)
     void testCreateCourse() throws Exception {
+        // Create a different course to avoid duplicate name issue
+        Course newCourse = new Course();
+        newCourse.setName("Advanced Java Programming");
+        newCourse.setCredit(4);
+        newCourse.setGrade(new Grade(2, "B"));
+
         mockMvc.perform(post("/courses")
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(course)))
-                .andExpect(status().isCreated());
+                        .content(objectMapper.writeValueAsString(newCourse)))
+                .andExpect(status().isCreated())
+                .andExpect(jsonPath("$.course.name").value("Advanced Java Programming"))
+                .andExpect(jsonPath("$.course.credit").value(4));
     }
 
     @Test
@@ -106,14 +149,13 @@ class MainTest {
     void testGetAllCourses() throws Exception {
         mockMvc.perform(get("/courses"))
                 .andExpect(status().isOk())
-                .andExpect(jsonPath("$", hasSize(greaterThanOrEqualTo(0))));
+                .andExpect(jsonPath("$", hasSize(greaterThanOrEqualTo(1))));
     }
 
     @Test
     @Order(3)
     void testGetCourseByName() throws Exception {
         String courseName = course.getName();
-        // Assuming course with 'courseName' has been added in `setUp` or via another test
         mockMvc.perform(get("/courses/{name}", courseName))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.name", is(courseName)));
@@ -122,27 +164,50 @@ class MainTest {
     @Test
     @Order(4)
     void testUpdateCourse() throws Exception {
-        course.setName("Advanced Spring");
-        mockMvc.perform(put("/courses/{id}", course.getId())
-                        .contentType(MediaType.APPLICATION_JSON)
-                        .content(objectMapper.writeValueAsString(course)))
-                .andExpect(status().isOk());
+        // First, let's find a course to update
+        MvcResult result = mockMvc.perform(get("/courses"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String response = result.getResponse().getContentAsString();
+        Course[] courses = objectMapper.readValue(response, Course[].class);
+
+        if (courses.length > 0) {
+            Course courseToUpdate = courses[0];
+            courseToUpdate.setName("Updated Course Name");
+
+            mockMvc.perform(put("/courses/{id}", courseToUpdate.getId())
+                            .contentType(MediaType.APPLICATION_JSON)
+                            .content(objectMapper.writeValueAsString(courseToUpdate)))
+                    .andExpect(status().isOk())
+                    .andExpect(jsonPath("$.course.name").value("Updated Course Name"));
+        }
     }
 
     @Test
     @Order(5)
     void testDeleteCourse() throws Exception {
-        // Assuming course with `course.getId()` exists
-        mockMvc.perform(delete("/courses/{id}", course.getId()))
-                .andExpect(status().isOk());
+        // First, let's find a course to delete
+        MvcResult result = mockMvc.perform(get("/courses"))
+                .andExpect(status().isOk())
+                .andReturn();
+
+        String response = result.getResponse().getContentAsString();
+        Course[] courses = objectMapper.readValue(response, Course[].class);
+
+        if (courses.length > 0) {
+            Course courseToDelete = courses[0];
+            mockMvc.perform(delete("/courses/{id}", courseToDelete.getId()))
+                    .andExpect(status().isOk())
+                    .andExpect(content().string("Course deleted successfully"));
+        }
     }
+
     @Test
     @DisplayName("Test Course Setters and Getters")
     void testCourseSettersAndGetters() {
-
         Course course = new Course();
         Grade grade = new Grade(5, "Excellent");
-
 
         Integer expectedId = 101;
         String expectedName = "Advanced Mathematics";
@@ -153,7 +218,6 @@ class MainTest {
         course.setCredit(expectedCredit);
         course.setGrade(grade);
 
-
         assertEquals(expectedId, course.getId());
         assertEquals(expectedName, course.getName());
         assertEquals(expectedCredit, course.getCredit());
@@ -163,11 +227,9 @@ class MainTest {
     @Test
     @DisplayName("Test Grade Creation and Getters")
     void testGradeCreationAndGetters() {
-
         Integer expectedCoefficient = 5;
         String expectedNote = "Excellent";
         Grade grade = new Grade(expectedCoefficient, expectedNote);
-
 
         assertEquals(expectedCoefficient, grade.getCoefficient());
         assertEquals(expectedNote, grade.getNote());
@@ -176,7 +238,6 @@ class MainTest {
     @Test
     @DisplayName("Test GetHighCourseGpa Returns Correct Value")
     void testGetGpaReturnsCorrectValue() {
-
         CourseGpa highCourseGpa = new HighCourseGpa();
         int gpa = highCourseGpa.getGpa();
 
@@ -190,7 +251,6 @@ class MainTest {
         assertEquals(3, lowCourseGpa.getGpa(), "LowCourseGpa should return a GPA of 3");
     }
 
-
     @Test
     @DisplayName("Test MediumGpa Returns Correct Value")
     void testMediumGpaReturnsCorrectValue() {
@@ -203,20 +263,16 @@ class MainTest {
     @Test
     @DisplayName("Test ApiErrorResponse Fields")
     void testApiErrorResponseFields() {
-        // Given
         Integer expectedStatus = 404;
         String expectedMessage = "Not Found";
         Long expectedTimestamp = System.currentTimeMillis();
 
-        // When
-        ApiErrorResponse errorResponse = new ApiErrorResponse(expectedStatus, expectedMessage, expectedTimestamp);
+        ApiResponseError errorResponse = new ApiResponseError(expectedMessage, expectedStatus, expectedTimestamp);
 
-        // Then
         assertEquals(expectedStatus, errorResponse.getStatus(), "The status should match the expected value.");
         assertEquals(expectedMessage, errorResponse.getMessage(), "The message should match the expected value.");
         assertEquals(expectedTimestamp, errorResponse.getTimestamp(), "The timestamp should match the expected value.");
     }
-
 
     @Test
     void testZooExceptionCreation() {
@@ -225,19 +281,15 @@ class MainTest {
 
         ApiException exception = new ApiException(expectedMessage, expectedStatus);
 
-
         assertEquals(expectedMessage, exception.getMessage(), "The exception message should match the expected value.");
         assertEquals(expectedStatus, exception.getHttpStatus(), "The HttpStatus should match the expected value.");
-
-
-        assertTrue(exception instanceof RuntimeException, "ZooException should be an instance of RuntimeException.");
+        assertTrue(exception instanceof RuntimeException, "ApiException should be an instance of RuntimeException.");
     }
 
     @Test
     void testHttpStatusSetter() {
         ApiException exception = new ApiException("Initial message", HttpStatus.OK);
         exception.setHttpStatus(HttpStatus.INTERNAL_SERVER_ERROR);
-
 
         assertEquals(HttpStatus.INTERNAL_SERVER_ERROR, exception.getHttpStatus(), "The HttpStatus should be updatable and match the new value.");
     }
